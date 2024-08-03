@@ -2383,9 +2383,14 @@ error_code RdbLoader::HandleAux() {
       VLOG(1) << "RDB age " << strings::HumanReadableElapsedTime(age);
     }
   } else if (auxkey == "used-mem") {
-    long long usedmem;
+    int64_t usedmem;
     if (absl::SimpleAtoi(auxval, &usedmem)) {
       VLOG(1) << "RDB memory usage when created " << strings::HumanReadableNumBytes(usedmem);
+      if (usedmem > ssize_t(max_memory_limit)) {
+        LOG(WARNING) << "Could not load snapshot - its used memory is " << usedmem
+                     << " but the limit is " << max_memory_limit;
+        return RdbError(errc::out_of_memory);
+      }
     }
   } else if (auxkey == "aof-preamble") {
     long long haspreamble;

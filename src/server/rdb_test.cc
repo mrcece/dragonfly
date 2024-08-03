@@ -45,6 +45,7 @@ class RdbTest : public BaseFamilyTest {
 
 void RdbTest::SetUp() {
   InitWithDbFilename();
+  max_memory_limit = 3000000;
 }
 
 inline const uint8_t* to_byte(const void* s) {
@@ -86,7 +87,7 @@ TEST_F(RdbTest, LoadEmpty) {
   io::FileSource fs = GetSource("empty.rdb");
   RdbLoader loader(NULL);
   auto ec = loader.Load(&fs);
-  CHECK(!ec);
+  ASSERT_FALSE(ec) << ec;
 }
 
 TEST_F(RdbTest, LoadSmall6) {
@@ -540,6 +541,12 @@ TEST_F(RdbTest, SBF) {
   Run({"debug", "reload"});
   EXPECT_EQ(Run({"type", "k"}), "MBbloom--");
   EXPECT_THAT(Run({"BF.EXISTS", "k", "1"}), IntArg(1));
+}
+
+TEST_F(RdbTest, SnapshotTooBig) {
+  Run({"debug", "populate", "10000", "foo", "1000"});
+  max_memory_limit = 10000;
+  Run({"debug", "reload"});
 }
 
 }  // namespace dfly
