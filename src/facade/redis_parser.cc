@@ -13,15 +13,20 @@ namespace facade {
 using namespace std;
 
 auto RedisParser::Parse(Buffer str, uint32_t* consumed, RespExpr::Vec* res) -> Result {
+  DCHECK(!str.empty());
   *consumed = 0;
   res->clear();
 
-  if (str.size() < 2) {
+  if (str.size() + small_len_ < 2) {
+    memcpy(small_buf_ + small_len_, str.data(), str.size());
+    small_len_ += str.size();
+    *consumed = str.size();
+
     return INPUT_PENDING;
   }
 
   if (state_ == CMD_COMPLETE_S) {
-    InitStart(str[0], res);
+    InitStart(small_len_ > 0 ? small_buf_[0] : str[0], res);
   } else {
     // We continue parsing in the middle.
     if (!cached_expr_)
@@ -38,11 +43,8 @@ auto RedisParser::Parse(Buffer str, uint32_t* consumed, RespExpr::Vec* res) -> R
         resultc = ConsumeArrayLen(str);
         break;
       case PARSE_ARG_S:
-        if (str.size() == 0 || (str.size() < 4 && str[0] != '_')) {
-          resultc.first = INPUT_PENDING;
-        } else {
-          resultc = ParseArg(str);
-        }
+        DCHECK(!str.empty());
+        resultc = ParseArg(str);
         break;
       case INLINE_S:
         DCHECK(parse_stack_.empty());
@@ -65,6 +67,7 @@ auto RedisParser::Parse(Buffer str, uint32_t* consumed, RespExpr::Vec* res) -> R
     }
 
     if (resultc.first == INPUT_PENDING) {
+      DCHECK(str.empty());
       StashState(res);
     }
     return resultc.first;
@@ -72,6 +75,8 @@ auto RedisParser::Parse(Buffer str, uint32_t* consumed, RespExpr::Vec* res) -> R
 
   if (resultc.first == OK) {
     DCHECK(cached_expr_);
+    DCHECK_EQ(0, small_len_);
+
     if (res != cached_expr_) {
       DCHECK(!stash_.empty());
 
@@ -212,19 +217,36 @@ auto RedisParser::ParseInline(Buffer str) -> ResultConsumed {
 auto RedisParser::ParseLen(Buffer str, int64_t* res) -> ResultConsumed {
   DCHECK(!str.empty());
 
-  char* s = reinterpret_cast<char*>(str.data() + 1);
-  char* pos = reinterpret_cast<char*>(memchr(s, '\n', str.size() - 1));
+  DCHECK(small_len_ > 0 || str[0] == '$' || str[0] == '*' || str[0] == '%' || str[0] == '~');
+
+  const char* s = reinterpret_cast<const char*>(str.data());
+  unsigned consumed = 0;
+  const char* pos = reinterpret_cast<const char*>(memchr(s, '\n', str.size()));
   if (!pos) {
-    Result r = str.size() < 32 ? INPUT_PENDING : BAD_ARRAYLEN;
-    return {r, 0};
+    if (str.size() + small_len_ < sizeof(small_buf_)) {
+      memcpy(small_buf_ + small_len_, str.data(), str.size());
+      small_len_ += str.size();
+      return {INPUT_PENDING, str.size()};
+    }
+    return ResultConsumed{BAD_ARRAYLEN, 0};
+  }
+
+  consumed = pos - s + 1;
+  if (small_len_ > 0) {
+    memcpy(small_buf_ + small_len_, str.data(), consumed);
+    small_len_ += consumed;
+    s = small_buf_;
+    pos = small_buf_ + small_len_ - 1;
+    small_len_ = 0;
   }
 
   if (pos[-1] != '\r') {
     return {BAD_ARRAYLEN, 0};
   }
 
-  bool success = absl::SimpleAtoi(std::string_view{s, size_t(pos - s - 1)}, res);
-  return ResultConsumed{success ? OK : BAD_ARRAYLEN, (pos - s) + 2};
+  // Skip the first character and 2 last ones (\r\n).
+  bool success = absl::SimpleAtoi(std::string_view{s + 1, size_t(pos - 1 - s)}, res);
+  return ResultConsumed{success ? OK : BAD_ARRAYLEN, consumed};
 }
 
 auto RedisParser::ConsumeArrayLen(Buffer str) -> ResultConsumed {
@@ -288,7 +310,15 @@ auto RedisParser::ConsumeArrayLen(Buffer str) -> ResultConsumed {
 
 auto RedisParser::ParseArg(Buffer str) -> ResultConsumed {
   DCHECK(!str.empty());
-  char c = str[0];
+
+  char c = small_len_ > 0 ? small_buf_[0] : str[0];
+  unsigned min_len = 3 + int(c != '_');
+
+  if (small_len_ + str.size() < min_len) {
+    memcpy(small_buf_ + small_len_, str.data(), str.size());
+    small_len_ += str.size();
+    return {INPUT_PENDING, str.size()};
+  }
 
   if (c == '$') {
     int64_t len;
@@ -321,12 +351,22 @@ auto RedisParser::ParseArg(Buffer str) -> ResultConsumed {
   }
 
   if (c == '_') {  // Resp3 NIL
-    // TODO: Do we need to validate that str[1:2] == "\r\n"?
+    // '_','\r','\n'
+    DCHECK_GE(small_len_ + str.size(), 3u);
+    DCHECK_LT(small_len_, 3);
+
+    unsigned consumed = 3 - small_len_;
+    for (unsigned i = 0; i < consumed; ++i) {
+      small_buf_[small_len_ + i] = str[i];
+    }
+    if (small_buf_[1] != '\r' || small_buf_[2] != '\n') {
+      return {BAD_STRING, 0};
+    }
 
     cached_expr_->emplace_back(RespExpr::NIL);
     cached_expr_->back().u = Buffer{};
     HandleFinishArg();
-    return {OK, 3};  // // '_','\r','\n'
+    return {OK, consumed};
   }
 
   if (c == '*') {
@@ -390,6 +430,26 @@ auto RedisParser::ConsumeBulk(Buffer str) -> ResultConsumed {
 
   uint32_t consumed = 0;
 
+  if (small_len_ > 0) {
+    DCHECK(!is_broken_token_);
+    DCHECK_EQ(bulk_len_, 0u);
+
+    if (bulk_len_ == 0) {
+      DCHECK_EQ(small_len_, 1);
+      DCHECK_GE(str.size(), 1u);
+      if (small_buf_[0] != '\r' || str[0] != '\n') {
+        return {BAD_STRING, 0};
+      }
+      consumed = bulk_len_ + 2;
+      small_len_ = 0;
+      HandleFinishArg();
+
+      return {OK, 1};
+    }
+  }
+
+  DCHECK_EQ(small_len_, 0);
+
   if (str.size() >= bulk_len_) {
     consumed = bulk_len_;
     if (bulk_len_) {
@@ -415,26 +475,24 @@ auto RedisParser::ConsumeBulk(Buffer str) -> ResultConsumed {
     return {INPUT_PENDING, consumed};
   }
 
-  if (str.size() >= 32) {
-    DCHECK(bulk_len_);
-    size_t len = std::min<size_t>(str.size(), bulk_len_);
+  DCHECK(bulk_len_);
+  size_t len = std::min<size_t>(str.size(), bulk_len_);
 
-    if (is_broken_token_) {
-      memcpy(bulk_str.end(), str.data(), len);
-      bulk_str = Buffer{bulk_str.data(), bulk_str.size() + len};
-      DVLOG(1) << "Extending bulk stash to size " << bulk_str.size();
-    } else {
-      DVLOG(1) << "New bulk stash size " << bulk_len_;
-      vector<uint8_t> nb(bulk_len_);
-      memcpy(nb.data(), str.data(), len);
-      bulk_str = Buffer{nb.data(), len};
-      buf_stash_.emplace_back(std::move(nb));
-      is_broken_token_ = true;
-      cached_expr_->back().has_support = true;
-    }
-    consumed = len;
-    bulk_len_ -= len;
+  if (is_broken_token_) {
+    memcpy(bulk_str.end(), str.data(), len);
+    bulk_str = Buffer{bulk_str.data(), bulk_str.size() + len};
+    DVLOG(1) << "Extending bulk stash to size " << bulk_str.size();
+  } else {
+    DVLOG(1) << "New bulk stash size " << bulk_len_;
+    vector<uint8_t> nb(bulk_len_);
+    memcpy(nb.data(), str.data(), len);
+    bulk_str = Buffer{nb.data(), len};
+    buf_stash_.emplace_back(std::move(nb));
+    is_broken_token_ = true;
+    cached_expr_->back().has_support = true;
   }
+  consumed = len;
+  bulk_len_ -= len;
 
   return {INPUT_PENDING, consumed};
 }
@@ -457,6 +515,7 @@ void RedisParser::HandleFinishArg() {
     }
     cached_expr_ = parse_stack_.back().second;
   }
+  small_len_ = 0;
 }
 
 void RedisParser::ExtendLastString(Buffer str) {
