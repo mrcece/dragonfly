@@ -1981,7 +1981,7 @@ void ServerFamily::Config(CmdArgList args, Transaction* tx, SinkReplyBuilder* bu
 
 void ServerFamily::Debug(CmdArgList args, Transaction* tx, SinkReplyBuilder* builder,
                          ConnectionContext* cntx) {
-  DebugCmd dbg_cmd{this, cntx};
+  DebugCmd dbg_cmd{this, &service_.cluster_family(), cntx};
 
   return dbg_cmd.Run(args, builder);
 }
